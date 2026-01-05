@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
+import math
 
 # --- 1. CONFIGURATION & STYLING ---
 st.set_page_config(page_title="Data-Driven Option Analyzer", layout="wide")
@@ -12,11 +12,19 @@ This app calculates Entry, SL, and Targets based **strictly** on Greeks (Delta, 
 No random percentages. No static defaults.
 """)
 
-# --- 2. THE CALCULATION ENGINE (Hidden from UI) ---
+# --- 2. CUSTOM MATH FUNCTIONS (No Scipy Required) ---
+def norm_pdf(x):
+    """Standard normal probability density function"""
+    return math.exp(-x**2 / 2) / math.sqrt(2 * math.pi)
+
+def norm_cdf(x):
+    """Standard normal cumulative distribution function"""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+# --- 3. THE CALCULATION ENGINE ---
 def analyze_data(df):
     try:
         # CLEANING: Handle messy column names and strings
-        # We look for standard NSE column structures or normalize them
         df.columns = df.columns.str.strip().str.upper()
         
         # Helper to clean numbers
@@ -28,11 +36,10 @@ def analyze_data(df):
             return x
 
         # IDENTIFY COLUMNS (Auto-detect logic)
-        # We look for columns containing specific keywords
         col_map = {
             'strike': [c for c in df.columns if 'STRIKE' in c][0],
-            'iv_call': [c for c in df.columns if 'IV' in c][0], # First IV usually Call
-            'iv_put': [c for c in df.columns if 'IV' in c][-1], # Last IV usually Put
+            'iv_call': [c for c in df.columns if 'IV' in c][0],
+            'iv_put': [c for c in df.columns if 'IV' in c][-1],
             'ltp_call': [c for c in df.columns if 'LTP' in c][0],
             'ltp_put': [c for c in df.columns if 'LTP' in c][-1],
             'vol_call': [c for c in df.columns if 'VOLUME' in c][0],
@@ -66,21 +73,22 @@ def analyze_data(df):
 
 def calculate_trade(row, spot, trade_type):
     # PARAMETERS
-    T = 1.0 / 365.0  # 1 Day to expiry (Conservative / Intraday)
+    T = 1.0 / 365.0  # 1 Day to expiry
     r = 0.10         # Risk Free Rate
     
     K = row['strike']
     
+    # Calculate Greeks using Custom Math (No Scipy)
     if trade_type == 'Call':
         price = row['ce_ltp']
         sigma = row['ce_iv'] / 100.0
-        if sigma <= 0: sigma = 0.2 # Fallback if IV missing
+        if sigma <= 0: sigma = 0.2
         
         d1 = (np.log(spot / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
-        delta = norm.cdf(d1)
-        # Daily Theta
-        theta = (- (spot * sigma * norm.pdf(d1)) / (2 * np.sqrt(T))) / 365.0
+        
+        delta = norm_cdf(d1)
+        theta = (- (spot * sigma * norm_pdf(d1)) / (2 * np.sqrt(T))) / 365.0
         
     else: # Put
         price = row['pe_ltp']
@@ -89,27 +97,20 @@ def calculate_trade(row, spot, trade_type):
         
         d1 = (np.log(spot / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
-        delta = norm.cdf(d1) - 1
-        theta = (- (spot * sigma * norm.pdf(d1)) / (2 * np.sqrt(T))) / 365.0
+        
+        delta = norm_cdf(d1) - 1
+        theta = (- (spot * sigma * norm_pdf(d1)) / (2 * np.sqrt(T))) / 365.0
 
     # --- THE "NO BLIND NUMBERS" FORMULAS ---
-    
-    # 1. Volatility Stop: How much does Spot move in a normal day?
-    # IV / 19.1 = Daily % Move (1 Standard Deviation)
     daily_move_pts = (spot * sigma) / 19.1
-    
-    # 2. Option Price Risk: Spot Move * Delta
     option_risk = daily_move_pts * abs(delta)
     
-    # 3. Targets
     sl_price = price - option_risk
-    tp_price = price + (option_risk * 2.0) # 1:2 Risk Reward
+    tp_price = price + (option_risk * 2.0)
     
-    # 4. Max Hold Time (Theta Limit)
-    # If we lose >10% of premium to Time Decay, the trade is dead.
     decay_budget = price * 0.10
     if abs(theta) > 0:
-        max_hours = (decay_budget / abs(theta)) * 6.0 # Trading hours approx
+        max_hours = (decay_budget / abs(theta)) * 6.0 
     else:
         max_hours = 0
         
@@ -124,13 +125,11 @@ def calculate_trade(row, spot, trade_type):
         "Reasoning": f"IV: {round(sigma*100,1)}% | Delta: {round(delta,2)} | Theta: {round(theta,2)}"
     }
 
-# --- 3. THE UI INTERFACE ---
+# --- 4. THE UI INTERFACE ---
 
 uploaded_file = st.file_uploader("Upload Option Chain CSV", type=['csv'])
 
 if uploaded_file is not None:
-    # Read File
-    # Skip header=1 usually for NSE files, but we'll try auto
     try:
         df = pd.read_csv(uploaded_file, header=1) 
     except:
@@ -141,7 +140,6 @@ if uploaded_file is not None:
     if spot:
         st.success(f"✅ Market Data Loaded. Calculated Spot Price: **{round(spot, 2)}**")
         
-        # Filter for Liquid Strikes near Spot
         processed_data['dist'] = abs(processed_data['strike'] - spot)
         near_atm = processed_data.sort_values('dist').head(1)
         
@@ -153,8 +151,6 @@ if uploaded_file is not None:
             with col1:
                 st.subheader("🚀 Bullish Trade (Call)")
                 call_res = calculate_trade(row, spot, 'Call')
-                
-                # Display Metrics
                 st.metric("Strike", f"{call_res['Strike']} CE")
                 st.metric("Entry", call_res['Entry Price'])
                 st.metric("Stop Loss", call_res['Stop Loss'], delta=-call_res['Risk (Pts)'])
@@ -165,8 +161,6 @@ if uploaded_file is not None:
             with col2:
                 st.subheader("🐻 Bearish Trade (Put)")
                 put_res = calculate_trade(row, spot, 'Put')
-                
-                # Display Metrics
                 st.metric("Strike", f"{put_res['Strike']} PE")
                 st.metric("Entry", put_res['Entry Price'])
                 st.metric("Stop Loss", put_res['Stop Loss'], delta=-put_res['Risk (Pts)'])
